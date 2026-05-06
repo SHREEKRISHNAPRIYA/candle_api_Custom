@@ -919,7 +919,53 @@ bool candle_get_state(struct candle_device *device, uint8_t channel, struct cand
     return true;
 }
 
-bool candle_send_frame_nowait(struct candle_device *device, uint8_t channel, struct candle_can_frame *frame) {
+/*
+ * candle_api_noecho.c — Patch for candle_api.c
+ *
+ * ROOT CAUSE OF 32-MESSAGE LIMIT:
+ * ─────────────────────────────────
+ * candle_send_frame_nowait() and candle_send_frame() both allocate an
+ * echo_id slot from a 32-bit atomic pool before every TX:
+ *
+ *   echo_id_pool: bit N = 1 means slot N is occupied (waiting for echo)
+ *
+ * When the device sends an echo frame back, receive_bulk_callback() fires:
+ *   atomic_fetch_and(&pool, ~(1 << hf->echo_id))   ← frees slot N
+ *
+ * When the device sends NO echo (our M253 firmware), the slot is never freed.
+ * After 32 sends all 32 bits are set (pool == 0xFFFFFFFF).
+ * candle_send_frame_nowait() returns false. candle_send_frame() blocks
+ * in cnd_timedwait() until timeout → Python gets TimeoutError.
+ *
+ * THE FIX — Two changes, both minimal:
+ * ──────────────────────────────────────
+ *
+ * CHANGE 1: In candle_send_frame_nowait() and candle_send_frame(),
+ *   send with echo_id = 0xFFFFFFFF instead of allocating from pool.
+ *   0xFFFFFFFF is the gs_usb "no echo" sentinel. The device treats
+ *   TX frames normally regardless of echo_id value.
+ *   receive_bulk_callback() already has:
+ *     if (hf->echo_id != 0xFFFFFFFF) { free pool slot }
+ *   So using 0xFFFFFFFF as echo_id means the pool is never touched.
+ *   Pool stays at 0x00000000 forever. No 32-message limit.
+ *
+ * CHANGE 2: In receive_bulk_callback(), all frames go into rx_fifo
+ *   regardless of echo_id. The Python layer (candle_bus.py) filters
+ *   on frame_type.rx to separate genuine RX from echo frames.
+ *   Since we send echo_id=0xFFFFFFFF, convert_frame() already sets
+ *   CANDLE_FRAME_TYPE_RX for these — the Python filter works correctly.
+ *
+ * FILES TO CHANGE:
+ *   candle_api.c  — the two functions below replace their originals
+ *
+ * NO OTHER CHANGES NEEDED. The rest of candle_api.c is unchanged.
+ */
+
+/* ── CHANGE 1a: candle_send_frame_nowait — use 0xFFFFFFFF, skip pool ──────── */
+bool candle_send_frame_nowait(struct candle_device *device,
+                               uint8_t channel,
+                               struct candle_can_frame *frame)
+{
     struct candle_device_handle *handle = device->handle;
 
     if (channel >= device->channel_count)
@@ -931,43 +977,33 @@ bool candle_send_frame_nowait(struct candle_device *device, uint8_t channel, str
     if (frame->can_dlc >= ARRAY_SIZE(dlc2len))
         return false;
 
-    if (frame->type & CANDLE_FRAME_TYPE_FD && !(device->channels[channel].feature & CANDLE_FEATURE_FD))
+    if (frame->type & CANDLE_FRAME_TYPE_FD &&
+        !(device->channels[channel].feature & CANDLE_FEATURE_FD))
         return false;
 
-    // get echo id
-    uint32_t echo_id_pool;
-    uint32_t echo_id = 0;
-    while (true) {
-        // trying to preempt the echo id
-        echo_id_pool = atomic_fetch_or(&handle->channels[channel].echo_id_pool, 1 << echo_id);
-
-        // preempt the echo id
-        if (!(echo_id_pool & (1 << echo_id))) {
-            break;
-        }
-
-        // no echo id available
-        if (echo_id_pool == (uint32_t)(-1)) {
-            return false;
-        }
-
-        // find available echo id
-        for (int i = 0; i < 32; ++i) {
-            if (!(echo_id_pool & (1 << i))) {
-                echo_id = i;
-                break;
-            }
-        }
-    }
-
-    return send_frame(handle, channel, frame, echo_id);
+    /*
+     * CHANGE: echo_id = 0xFFFFFFFF (gs_usb "no echo" sentinel).
+     *
+     * Original code allocated a slot from echo_id_pool here:
+     *   echo_id_pool = atomic_fetch_or(&pool, 1 << echo_id);
+     * When the device sends no echo back, that slot was never freed.
+     * After 32 calls pool == 0xFFFFFFFF and this function returned false.
+     *
+     * With echo_id = 0xFFFFFFFF:
+     *   - Pool is never touched (no allocation, no free)
+     *   - receive_bulk_callback() skips pool-free for 0xFFFFFFFF anyway
+     *   - Pool stays at 0x00000000 — unlimited TX
+     */
+    return send_frame(handle, channel, frame, 0xFFFFFFFF);
 }
 
-bool candle_send_frame(struct candle_device *device, uint8_t channel, struct candle_can_frame *frame, uint32_t milliseconds) {
+/* ── CHANGE 1b: candle_send_frame — use 0xFFFFFFFF, skip pool entirely ─────── */
+bool candle_send_frame(struct candle_device *device,
+                        uint8_t channel,
+                        struct candle_can_frame *frame,
+                        uint32_t milliseconds)
+{
     struct candle_device_handle *handle = device->handle;
-
-    struct timespec ts;
-    milliseconds_to_timespec(milliseconds, &ts);
 
     if (channel >= device->channel_count)
         return false;
@@ -978,45 +1014,46 @@ bool candle_send_frame(struct candle_device *device, uint8_t channel, struct can
     if (frame->can_dlc >= ARRAY_SIZE(dlc2len))
         return false;
 
-    if (frame->type & CANDLE_FRAME_TYPE_FD && !(device->channels[channel].feature & CANDLE_FEATURE_FD))
+    if (frame->type & CANDLE_FRAME_TYPE_FD &&
+        !(device->channels[channel].feature & CANDLE_FEATURE_FD))
         return false;
 
-    // get echo id
-    uint32_t echo_id_pool;
-    uint32_t echo_id = 0;
-    mtx_lock(&handle->channels[channel].echo_id_cond_mtx);
-    while (true) {
-        // trying to preempt the echo id
-        echo_id_pool = atomic_fetch_or(&handle->channels[channel].echo_id_pool, 1 << echo_id);
-
-        // preempt the echo id
-        if (!(echo_id_pool & (1 << echo_id))) {
-            mtx_unlock(&handle->channels[channel].echo_id_cond_mtx);
-            break;
-        }
-
-        // no echo id available
-        while (echo_id_pool == (uint32_t)(-1)) {
-            if (cnd_timedwait(&handle->channels[channel].echo_id_cnd, &handle->channels[channel].echo_id_cond_mtx, &ts) == thrd_success) {
-                echo_id_pool = atomic_load(&handle->channels[channel].echo_id_pool);
-            }
-            else {
-                mtx_unlock(&handle->channels[channel].echo_id_cond_mtx);
-                return false;
-            }
-        }
-
-        // find available echo id
-        for (int i = 0; i < 32; ++i) {
-            if (!(echo_id_pool & (1 << i))) {
-                echo_id = i;
-                break;
-            }
-        }
-    }
-
-    return send_frame(handle, channel, frame, echo_id);
+    /*
+     * CHANGE: skip pool allocation entirely, send with echo_id=0xFFFFFFFF.
+     *
+     * Original code:
+     *   mtx_lock(&echo_id_cond_mtx);
+     *   while(true) {
+     *     try atomic_fetch_or to get slot;
+     *     if pool full: cnd_timedwait() → timeout → return false;
+     *   }
+     *
+     * That timeout is what Python sees as TimeoutError: Send timeout.
+     * With no pool interaction this function never blocks or times out.
+     */
+    return send_frame(handle, channel, frame, 0xFFFFFFFF);
 }
+
+/*
+ * receive_bulk_callback() — NO CHANGE NEEDED.
+ *
+ * The existing code already handles echo_id == 0xFFFFFFFF correctly:
+ *
+ *   if (hf->echo_id != 0xFFFFFFFF) {
+ *       // free pool slot  ← skipped when echo_id == 0xFFFFFFFF
+ *   }
+ *   // put in fifo          ← always runs, frame goes to rx_fifo
+ *   fifo_put(...)
+ *
+ * convert_frame() sets CANDLE_FRAME_TYPE_RX when echo_id == 0xFFFFFFFF:
+ *   if (hf->echo_id == 0xFFFFFFFF)
+ *       frame->type |= CANDLE_FRAME_TYPE_RX;
+ *
+ * So TX frames sent by the HOST (our send with echo_id=0xFFFFFFFF)
+ * will appear in the rx_fifo with CANDLE_FRAME_TYPE_RX set IF the
+ * device echoes them. Since our device does NOT echo, nothing appears.
+ * Pool stays empty. Everything works.
+ */
 
 bool candle_receive_frame_nowait(struct candle_device *device, uint8_t channel, struct candle_can_frame *frame) {
     struct candle_device_handle *handle = device->handle;
