@@ -64,6 +64,21 @@ struct candle_state {
     uint32_t txerr;
 };
 
+typedef struct {
+    uint32_t error_class;       /* CANDLE_ERR_* flags OR'd together         */
+    uint8_t  bus_state;         /* CANDLE_BUS_STATE_*                       */
+    uint8_t  tx_error_count;    /* M_CAN TEC register value                 */
+    uint8_t  rx_error_count;    /* M_CAN REC register value                 */
+    uint8_t  ctrl_error;        /* CANDLE_ERR_CRTL_* flags                  */
+    uint8_t  last_error_code;   /* CANDLE_LEC_* — what caused the error     */
+    bool     is_busoff;         /* convenience: true if bus-off             */
+    bool     is_passive;        /* convenience: true if error-passive       */
+    bool     is_warning;        /* convenience: true if error-warning       */
+    bool     is_rx_overflow;    /* convenience: true if RX buffer overflowed*/
+    bool     is_ack_error;      /* convenience: true if no ACK (no receiver)*/
+    const char *description;    /* human-readable string                    */
+} candle_error_frame_t;
+
 struct candle_bit_timing_const {
     uint32_t tseg1_min;
     uint32_t tseg1_max;
@@ -135,7 +150,7 @@ bool candle_send_frame(struct candle_device *device, uint8_t channel, struct can
 bool candle_receive_frame_nowait(struct candle_device *device, uint8_t channel, struct candle_can_frame *frame);
 bool candle_receive_frame(struct candle_device *device, uint8_t channel, struct candle_can_frame *frame, uint32_t milliseconds);
 bool candle_wait_for_frame(struct candle_device *device, uint32_t milliseconds);
-
+bool candle_decode_error_frame(const struct candle_can_frame *frame,candle_error_frame_t *err);
 #ifdef __cplusplus
 }
 #endif
