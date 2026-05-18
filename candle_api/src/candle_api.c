@@ -8,6 +8,90 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+/*
+ * candle_api_error.c
+ * ==================
+ * Error frame handling additions for candle_api.c
+ *
+ * ARCHITECTURE:
+ * ─────────────
+ * gs_usb error frames follow Linux SocketCAN error frame convention:
+ *   gs_host_frame.can_id has CAN_ERR_FLAG (bit 29) set
+ *   gs_host_frame.can_id lower bits carry error class (CAN_ERR_*)
+ *   gs_host_frame.classic_can->data[0..7] carry error details
+ *
+ * Error frame data layout (SocketCAN convention):
+ *   data[0] = tx error count  (from M_CAN ECR.TEC)
+ *   data[1] = rx error count  (from M_CAN ECR.REC)
+ *   data[2] = error class     (see CANDLE_ERR_CLASS_* below)
+ *   data[3] = bus state       (active / warning / passive / busoff)
+ *   data[4] = last error code (from M_CAN PSR.LEC)
+ *   data[5..7] = reserved (0)
+ *
+ * HOW THE M253 FIRMWARE SENDS ERROR FRAMES (to implement later):
+ *   In CANFD0_IRQ0_IRQHandler, enable CANFD_IE_BOE_Msk | CANFD_IE_EWE_Msk
+ *   | CANFD_IE_EPE_Msk | CANFD_IE_RF0LE_Msk. When these fire, call
+ *   GS_USB_SendErrorFrame() which builds a gs_host_frame with
+ *   can_id = CAN_ERR_FLAG | error_class, data[0..4] from M_CAN registers,
+ *   echo_id = 0xFFFFFFFF (RX frame type), and sends it over EP2 Bulk IN.
+ *
+ * HOW candle_api RECEIVES THEM (this file):
+ *   receive_bulk_callback() already puts ALL frames in rx_fifo.
+ *   convert_frame() already sets CANDLE_FRAME_TYPE_ERR for CAN_ERR_FLAG.
+ *   We add candle_decode_error_frame() to extract structured error info
+ *   from the raw frame data bytes.
+ *
+ * HOW python-can SEES THEM:
+ *   candle_bus.py _recv_internal() already creates can.Message with
+ *   is_error_frame=True when frame_type.error_frame is set.
+ *   We add error detail fields to CandleCanFrame in the pybind11 binding
+ *   so Python can read tx_errors, rx_errors, error_class, bus_state, lec.
+ */
+/* ── Error class flags (OR-able, same as Linux CAN_ERR_* in can/error.h) ── */
+/* These go into gs_host_frame.can_id bits [28:0] when CAN_ERR_FLAG is set */
+#define CANDLE_ERR_TX_TIMEOUT       (1U << 0)  /* TX timeout (no ACK)         */
+#define CANDLE_ERR_LOSTARB          (1U << 1)  /* Lost arbitration            */
+#define CANDLE_ERR_CRTL             (1U << 2)  /* Controller error            */
+#define CANDLE_ERR_PROT             (1U << 3)  /* Protocol violation          */
+#define CANDLE_ERR_TRX              (1U << 4)  /* Transceiver error           */
+#define CANDLE_ERR_ACK              (1U << 5)  /* No ACK on transmission      */
+#define CANDLE_ERR_BUSOFF           (1U << 6)  /* Bus off                     */
+#define CANDLE_ERR_BUSERROR         (1U << 7)  /* Bus error (general)         */
+#define CANDLE_ERR_RESTARTED        (1U << 8)  /* Controller restarted        */
+#define CANDLE_ERR_CNT              (1U << 9)  /* Error counters available    */
+
+/* data[2] — controller error detail (CANDLE_ERR_CRTL) */
+#define CANDLE_ERR_CRTL_UNSPEC          0x00   /* unspecified                 */
+#define CANDLE_ERR_CRTL_RX_OVERFLOW     0x01   /* RX buffer overflow          */
+#define CANDLE_ERR_CRTL_TX_OVERFLOW     0x02   /* TX buffer overflow          */
+#define CANDLE_ERR_CRTL_RX_WARNING      0x04   /* RX error count > 96         */
+#define CANDLE_ERR_CRTL_TX_WARNING      0x08   /* TX error count > 96         */
+#define CANDLE_ERR_CRTL_RX_PASSIVE      0x10   /* RX error count > 127        */
+#define CANDLE_ERR_CRTL_TX_PASSIVE      0x20   /* TX error count > 127        */
+#define CANDLE_ERR_CRTL_ACTIVE          0x40   /* Recovered to error-active   */
+
+/* data[3] — bus state (maps to M_CAN PSR.ACT field) */
+#define CANDLE_BUS_STATE_ERROR_ACTIVE   0x00   /* TEC/REC < 96                */
+#define CANDLE_BUS_STATE_ERROR_WARNING  0x01   /* TEC or REC > 96             */
+#define CANDLE_BUS_STATE_ERROR_PASSIVE  0x02   /* TEC or REC > 127            */
+#define CANDLE_BUS_STATE_BUS_OFF        0x03   /* TEC > 255                   */
+
+/* data[4] — Last Error Code (M_CAN PSR.LEC field) */
+#define CANDLE_LEC_NONE                 0x00   /* No error                    */
+#define CANDLE_LEC_STUFF                0x01   /* Stuff error                 */
+#define CANDLE_LEC_FORM                 0x02   /* Form error                  */
+#define CANDLE_LEC_ACK                  0x03   /* ACK error (no receiver)     */
+#define CANDLE_LEC_BIT1                 0x04   /* Bit1 error                  */
+#define CANDLE_LEC_BIT0                 0x05   /* Bit0 error                  */
+#define CANDLE_LEC_CRC                  0x06   /* CRC error                   */
+#define CANDLE_LEC_NOCHANGE             0x07   /* No change since last read   */
+
+/*
+ * candle_error_frame_t
+ * Decoded error information from a candle_can_frame with ERR flag set.
+ * Filled by candle_decode_error_frame().
+ */
+
 
 static const uint8_t dlc2len[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
 static struct libusb_context *ctx = NULL;
@@ -1118,3 +1202,76 @@ bool candle_wait_for_frame(struct candle_device *device, uint32_t milliseconds) 
     mtx_unlock(&handle->rx_cond_mtx);
     return r;
 }
+
+
+
+
+
+/*
+ * candle_decode_error_frame()
+ * Decodes a received error frame into candle_error_frame_t.
+ *
+ * Call this when frame->type & CANDLE_FRAME_TYPE_ERR is set.
+ * The frame data bytes carry error details placed there by the M253 firmware.
+ *
+ * Returns true if frame is an error frame and was decoded.
+ * Returns false if frame is not an error frame.
+ */
+bool candle_decode_error_frame(const struct candle_can_frame *frame,
+                                candle_error_frame_t *err)
+{
+    if (!(frame->type & CANDLE_FRAME_TYPE_ERR))
+        return false;
+
+    memset(err, 0, sizeof(*err));
+
+    /*
+     * can_id lower 29 bits carry the error class flags.
+     * (CAN_ERR_FLAG is bit 29, already consumed by CANDLE_FRAME_TYPE_ERR)
+     */
+    err->error_class = frame->can_id & 0x1FFFFFFF;
+
+    /* data[0] = TX error count */
+    err->tx_error_count = frame->data[0];
+
+    /* data[1] = RX error count */
+    err->rx_error_count = frame->data[1];
+
+    /* data[2] = controller error detail */
+    err->ctrl_error = frame->data[2];
+
+    /* data[3] = bus state */
+    err->bus_state = frame->data[3];
+
+    /* data[4] = last error code */
+    err->last_error_code = frame->data[4];
+
+    /* Convenience flags */
+    err->is_busoff    = (err->bus_state == CANDLE_BUS_STATE_BUS_OFF);
+    err->is_passive   = (err->bus_state == CANDLE_BUS_STATE_ERROR_PASSIVE);
+    err->is_warning   = (err->bus_state == CANDLE_BUS_STATE_ERROR_WARNING);
+    err->is_rx_overflow = (err->ctrl_error & CANDLE_ERR_CRTL_RX_OVERFLOW) != 0;
+    err->is_ack_error   = (err->error_class & CANDLE_ERR_ACK) != 0;
+
+    /* Human-readable description (priority order) */
+    if (err->is_busoff)
+        err->description = "Bus-off: TX error count exceeded 255";
+    else if (err->is_passive)
+        err->description = "Error-passive: TEC or REC > 127";
+    else if (err->is_warning)
+        err->description = "Error-warning: TEC or REC > 96";
+    else if (err->is_ack_error)
+        err->description = "ACK error: no receiver on bus";
+    else if (err->is_rx_overflow)
+        err->description = "RX buffer overflow";
+    else if (err->error_class & CANDLE_ERR_PROT)
+        err->description = "Protocol violation";
+    else if (err->error_class & CANDLE_ERR_BUSERROR)
+        err->description = "Bus error";
+    else
+        err->description = "CAN error";
+
+    return true;
+}
+
+
