@@ -34,7 +34,55 @@ class CandleFrameType:
     def error_state_indicator(self) -> bool:
         ...
 
+class CandleErrorFrame:
+    @property
+    def error_class(self) -> int:
+        ...
 
+    @property
+    def tx_error_count(self) -> int:
+        ...
+
+    @property
+    def rx_error_count(self) -> int:
+        ...
+
+    @property
+    def ctrl_error(self) -> int:
+        ...
+
+    @property
+    def bus_state(self) -> int:
+        ...
+
+    @property
+    def last_error_code(self) -> int:
+        ...
+
+    @property
+    def is_busoff(self) -> bool:
+        ...
+
+    @property
+    def is_passive(self) -> bool:
+        ...
+
+    @property
+    def is_warning(self) -> bool:
+        ...
+
+    @property
+    def is_rx_overflow(self) -> bool:
+        ...
+
+    @property
+    def is_ack_error(self) -> bool:
+        ...
+
+    @property
+    def description(self) -> str:
+        ...
+        
 class CandleCanFrame:
     def __init__(self, frame_type: CandleFrameType, can_id: int, can_dlc: int, data: Buffer) -> None:
         ...
@@ -43,6 +91,9 @@ class CandleCanFrame:
         ...
 
     def __release_buffer__(self, view: memoryview) -> None:
+        ...
+
+    def decode_error_frame(self) -> Optional[CandleErrorFrame]:
         ...
 
     @property
