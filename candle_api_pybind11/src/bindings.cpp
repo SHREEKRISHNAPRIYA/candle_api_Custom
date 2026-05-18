@@ -39,6 +39,65 @@ protected:
     candle_device* device_;
 };
 
+class CandleErrorFrame {
+public:
+    explicit CandleErrorFrame(const candle_error_frame_t& err): err_(err) { }
+
+    uint32_t getErrorClass() {
+        return err_.error_class;
+    }
+
+    uint8_t getTxErrorCount() {
+        return err_.tx_error_count;
+    }
+
+    uint8_t getRxErrorCount() {
+        return err_.rx_error_count;
+    }
+
+    uint8_t getCtrlError() {
+        return err_.ctrl_error;
+    }
+
+    uint8_t getBusState() {
+        return err_.bus_state;
+    }
+
+    uint8_t getLastErrorCode() {
+        return err_.last_error_code;
+    }
+
+    bool getIsBusOff() {
+        return err_.is_busoff;
+    }
+
+    bool getIsPassive() {
+        return err_.is_passive;
+    }
+
+    bool getIsWarning() {
+        return err_.is_warning;
+    }
+
+    bool getIsRxOverflow() {
+        return err_.is_rx_overflow;
+    }
+
+    bool getIsAckError() {
+        return err_.is_ack_error;
+    }
+
+    std::string getDescription() {
+        if (err_.description == nullptr)
+            return "";
+
+        return err_.description;
+    }
+
+private:
+    candle_error_frame_t err_;
+};
+
 class CandleFrameType {
 public:
     explicit CandleFrameType(const candle_frame_type& ft): ft_(ft) { }
@@ -100,7 +159,7 @@ private:
 class CandleCanFrame {
 public:
     explicit CandleCanFrame(const candle_can_frame& frame): frame_(frame) { }
-
+    
     CandleCanFrame(const CandleFrameType& frame_type, uint32_t can_id, uint8_t can_dlc, const py::buffer& data): frame_() {
         if (can_dlc > 15)
             throw py::value_error("DLC can only be between 0 and 15");
@@ -156,6 +215,15 @@ public:
             { dlc2len[frame_.can_dlc] },
             { 1 }
         );
+    }
+
+    std::optional<CandleErrorFrame> decodeErrorFrame() {
+    candle_error_frame_t err;
+
+    if (!candle_decode_error_frame(&frame_, &err))
+        return std::nullopt;
+
+    return CandleErrorFrame(err);
     }
 
 private:
@@ -435,6 +503,8 @@ private:
     uint8_t index_;
 };
 
+
+
 class CandleDevice: public CandleDeviceReference {
 public:
     using CandleDeviceReference::CandleDeviceReference;
@@ -544,6 +614,7 @@ PYBIND11_MODULE(bindings, m) {
         .def_property_readonly("data", &CandleCanFrame::getData)
         .def_property_readonly("timestamp_us", &CandleCanFrame::getTimestampUs)
         .def_property_readonly("timestamp", &CandleCanFrame::getTimestamp)
+        .def("decode_error_frame", &CandleCanFrame::decodeErrorFrame)
         .def_buffer(&CandleCanFrame::getBuffer);
 
     py::class_<CandleFeature>(m, "CandleFeature")
@@ -614,6 +685,20 @@ PYBIND11_MODULE(bindings, m) {
         .def("__getitem__", &CandleDevice::getChannel)
         .def("__len__", &CandleDevice::getChannelCount)
         .def("wait_for_frame", &CandleDevice::waitForFrame);
+
+    py::class_<CandleErrorFrame>(m, "CandleErrorFrame")
+        .def_property_readonly("error_class", &CandleErrorFrame::getErrorClass)
+        .def_property_readonly("tx_error_count", &CandleErrorFrame::getTxErrorCount)
+        .def_property_readonly("rx_error_count", &CandleErrorFrame::getRxErrorCount)
+        .def_property_readonly("ctrl_error", &CandleErrorFrame::getCtrlError)
+        .def_property_readonly("bus_state", &CandleErrorFrame::getBusState)
+        .def_property_readonly("last_error_code", &CandleErrorFrame::getLastErrorCode)
+        .def_property_readonly("is_busoff", &CandleErrorFrame::getIsBusOff)
+        .def_property_readonly("is_passive", &CandleErrorFrame::getIsPassive)
+        .def_property_readonly("is_warning", &CandleErrorFrame::getIsWarning)
+        .def_property_readonly("is_rx_overflow", &CandleErrorFrame::getIsRxOverflow)
+        .def_property_readonly("is_ack_error", &CandleErrorFrame::getIsAckError)
+        .def_property_readonly("description", &CandleErrorFrame::getDescription);
 
     m.def("list_device", list_device);
 }
